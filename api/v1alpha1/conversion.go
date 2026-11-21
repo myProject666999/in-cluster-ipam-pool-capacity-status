@@ -61,3 +61,14 @@ func Convert_v1alpha1_InClusterIPPoolSpec_To_v1alpha2_InClusterIPPoolSpec(in *In
 func Convert_v1alpha2_InClusterIPPoolSpec_To_v1alpha1_InClusterIPPoolSpec(in *v1alpha2.InClusterIPPoolSpec, out *InClusterIPPoolSpec, s conversion.Scope) error {
 	return autoConvert_v1alpha2_InClusterIPPoolSpec_To_v1alpha1_InClusterIPPoolSpec(in, out, s)
 }
+
+// Convert_v1alpha2_InClusterIPPoolStatusIPAddresses_To_v1alpha1_InClusterIPPoolStatusIPAddresses
+// is hand-written because the v1alpha2 status struct gained fields the deprecated
+// v1alpha1 API does not know (excluded, exhausted, countsCapped,
+// outOfRangeAllocations). Those fields are intentionally dropped on down-conversion;
+// the four shared numeric fields keep their exact meaning. Hub-spoke-hub round trips
+// still preserve the extra fields through the conversion-data annotation written by
+// the pool-level ConvertFrom.
+func Convert_v1alpha2_InClusterIPPoolStatusIPAddresses_To_v1alpha1_InClusterIPPoolStatusIPAddresses(in *v1alpha2.InClusterIPPoolStatusIPAddresses, out *InClusterIPPoolStatusIPAddresses, s conversion.Scope) error {
+	return autoConvert_v1alpha2_InClusterIPPoolStatusIPAddresses_To_v1alpha1_InClusterIPPoolStatusIPAddresses(in, out, s)
+}

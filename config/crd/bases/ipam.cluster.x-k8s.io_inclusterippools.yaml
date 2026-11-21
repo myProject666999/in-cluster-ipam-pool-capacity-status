@@ -162,6 +162,10 @@ spec:
       jsonPath: .status.ipAddresses.used
       name: Used
       type: integer
+    - description: True when no free IPs remain in the pool
+      jsonPath: .status.ipAddresses.exhausted
+      name: Exhausted
+      type: boolean
     name: v1alpha2
     schema:
       openAPIV3Schema:
@@ -241,9 +245,34 @@ spec:
                 description: Addresses reports the count of total, free, and used
                   IPs in the pool.
                 properties:
+                  countsCapped:
+                    description: |-
+                      CountsCapped is true when at least one of the integer counts is larger than
+                      the platform int range and therefore reported as math.MaxInt instead of its
+                      exact value. It only describes the precision of the numbers; it never
+                      participates in the Free or Exhausted calculation.
+                    type: boolean
+                  excluded:
+                    description: |-
+                      Excluded is the count of addresses declared in spec.Addresses that are not
+                      allocatable because they are removed by spec.ExcludedAddresses, the reserved
+                      network/broadcast (IPv4) or anycast (IPv6) addresses, or the gateway.
+                      Overlapping removals are counted only once because the count is a set
+                      difference. When no cap applies, total + excluded equals the size of the raw
+                      spec.Addresses set.
+                      Counts greater than int can contain will report as math.MaxInt.
+                    type: integer
+                  exhausted:
+                    description: |-
+                      Exhausted is true when Free is zero. It is the stable signal for upper-layer
+                      automation to alert on or trigger pool expansion. It is derived from the
+                      counts above and never computed independently.
+                    type: boolean
                   free:
                     description: |-
-                      Free is the count of unallocated IPs in the pool.
+                      Free is the count of unallocated IPs in the pool. It is clamped at zero and
+                      therefore never negative, even when allocations exist that fall outside the
+                      current allocatable set (see outOfRange).
                       Counts greater than int can contain will report as math.MaxInt.
                     type: integer
                   outOfRange:
@@ -252,6 +281,13 @@ spec:
                       contained within spec.Addresses.
                       Counts greater than int can contain will report as math.MaxInt.
                     type: integer
+                  outOfRangeAllocations:
+                    description: |-
+                      OutOfRangeAllocations is true when OutOfRange is greater than zero. It
+                      highlights the anomalous state where existing allocations fell outside the
+                      current allocatable set after a pool shrink or a new exclusion, so users do
+                      not have to infer the anomaly from numeric differences alone.
+                    type: boolean
                   total:
                     description: |-
                       Total is the total number of IPs configured for the pool.
@@ -259,7 +295,9 @@ spec:
                     type: integer
                   used:
                     description: |-
-                      Used is the count of allocated IPs in the pool.
+                      Used is the count of allocated IPs in the pool. It counts every IPAddress object
+                      that belongs to the pool, including ones that are no longer part of the
+                      allocatable set, i.e. used == in-range allocations + outOfRange.
                       Counts greater than int can contain will report as math.MaxInt.
                     type: integer
                 required:

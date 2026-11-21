@@ -19,7 +19,6 @@ package poolutil
 import (
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"net/netip"
 	"slices"
@@ -89,24 +88,36 @@ func FindFreePrefix(poolConfig *PrefixPoolConfig, inUseIPSet *netipx.IPSet) (net
 
 // PrefixCandidateCount returns the count of allocatable prefixes from the pool configuration.
 func PrefixCandidateCount(poolConfig *PrefixPoolConfig) (int, error) {
-	allocLen, err := validatedAllocationPrefixLength(poolConfig)
+	total, err := PrefixCandidateCountBig(poolConfig)
 	if err != nil {
 		return 0, err
+	}
+	count, _ := CapBigInt(total)
+	return count, nil
+}
+
+// PrefixCandidateCountBig returns the exact, uncapped number of allocatable
+// prefixes from the pool configuration. Use CapBigInt to derive the status value
+// and the overflow flag without losing the precision information.
+func PrefixCandidateCountBig(poolConfig *PrefixPoolConfig) (*big.Int, error) {
+	allocLen, err := validatedAllocationPrefixLength(poolConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	poolIPSet, err := PrefixesToIPSet(poolConfig.Prefixes)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	blockedIPSet, err := prefixPoolBlockedIPSet(poolConfig, nil)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	total := 0
+	total := big.NewInt(0)
 	for _, aggregate := range sortedPrefixes(poolIPSet.Prefixes()) {
-		total = addIntCapped(total, countAllocatablePrefixesInAggregate(aggregate, allocLen, blockedIPSet))
+		total.Add(total, countAllocatablePrefixesBig(aggregate, allocLen, blockedIPSet))
 	}
 	return total, nil
 }
@@ -277,48 +288,6 @@ func findFreePrefixInAggregate(aggregate netip.Prefix, targetBits int, blockedIP
 	return findFreePrefixInAggregate(right, targetBits, blockedIPSet)
 }
 
-// countAllocatablePrefixesInAggregate mirrors the search logic of findFreePrefixInAggregate
-// but instead of returning the first free prefix, it counts all allocatable child prefixes.
-// It uses the same recursive binary splitting: fully blocked subtrees contribute 0,
-// fully free subtrees contribute 2^(targetBits - bits), and partially blocked subtrees
-// are split further until the target prefix length is reached.
-func countAllocatablePrefixesInAggregate(aggregate netip.Prefix, targetBits int, blockedIPSet *netipx.IPSet) int {
-	if !aggregate.IsValid() {
-		return 0
-	}
-
-	bits := aggregate.Bits()
-	// The aggregate must be at least as large as the target and within address family bounds.
-	if bits > targetBits || bits < 0 || targetBits > aggregate.Addr().BitLen() {
-		return 0
-	}
-
-	// The entire aggregate is blocked => zero allocatable prefixes.
-	if blockedIPSet.ContainsPrefix(aggregate) {
-		return 0
-	}
-
-	// No part of the aggregate is blocked => all 2^(targetBits-bits) child prefixes are free.
-	if !blockedIPSet.OverlapsPrefix(aggregate) {
-		return twoPowerCapped(targetBits - bits)
-	}
-
-	// Already at target size but partially blocked => unusable.
-	if bits == targetBits {
-		return 0
-	}
-
-	// Split and sum allocatable prefixes from both halves.
-	left, right, ok := splitPrefix(aggregate)
-	if !ok {
-		return 0
-	}
-
-	leftCount := countAllocatablePrefixesInAggregate(left, targetBits, blockedIPSet)
-	rightCount := countAllocatablePrefixesInAggregate(right, targetBits, blockedIPSet)
-	return addIntCapped(leftCount, rightCount)
-}
-
 func splitPrefix(prefix netip.Prefix) (netip.Prefix, netip.Prefix, bool) {
 	if !prefix.IsValid() {
 		return netip.Prefix{}, netip.Prefix{}, false
@@ -339,30 +308,45 @@ func splitPrefix(prefix netip.Prefix) (netip.Prefix, netip.Prefix, bool) {
 	return left, right, true
 }
 
-func twoPowerCapped(exponent int) int {
-	if exponent < 0 {
-		return 0
-	}
-	if exponent == 0 {
-		return 1
+// countAllocatablePrefixesBig mirrors countAllocatablePrefixesInAggregate but
+// accumulates in a big.Int so pools larger than math.MaxInt are counted exactly.
+func countAllocatablePrefixesBig(aggregate netip.Prefix, targetBits int, blockedIPSet *netipx.IPSet) *big.Int {
+	if !aggregate.IsValid() {
+		return big.NewInt(0)
 	}
 
-	total := big.NewInt(1)
-	total.Lsh(total, uint(exponent))
-
-	maxInt := big.NewInt(int64(math.MaxInt))
-	if total.Cmp(maxInt) > 0 {
-		return math.MaxInt
+	bits := aggregate.Bits()
+	if bits > targetBits || bits < 0 || targetBits > aggregate.Addr().BitLen() {
+		return big.NewInt(0)
 	}
-	return int(total.Int64())
+
+	// The entire aggregate is blocked => zero allocatable prefixes.
+	if blockedIPSet.ContainsPrefix(aggregate) {
+		return big.NewInt(0)
+	}
+
+	// No part of the aggregate is blocked => all 2^(targetBits-bits) child prefixes are free.
+	if !blockedIPSet.OverlapsPrefix(aggregate) {
+		return twoPowerBig(targetBits - bits)
+	}
+
+	// Already at target size but partially blocked => unusable.
+	if bits == targetBits {
+		return big.NewInt(0)
+	}
+
+	left, right, ok := splitPrefix(aggregate)
+	if !ok {
+		return big.NewInt(0)
+	}
+
+	total := countAllocatablePrefixesBig(left, targetBits, blockedIPSet)
+	return total.Add(total, countAllocatablePrefixesBig(right, targetBits, blockedIPSet))
 }
 
-func addIntCapped(current, add int) int {
-	if current == math.MaxInt || add == math.MaxInt {
-		return math.MaxInt
+func twoPowerBig(exponent int) *big.Int {
+	if exponent <= 0 {
+		return big.NewInt(1)
 	}
-	if add > math.MaxInt-current {
-		return math.MaxInt
-	}
-	return current + add
+	return big.NewInt(1).Lsh(big.NewInt(1), uint(exponent))
 }

@@ -176,14 +176,12 @@ func AddressToIPSet(addressStr string) (*netipx.IPSet, error) {
 	return builder.IPSet()
 }
 
-// IPSetCount returns the number of IPs contained in the given IPSet.
-// This function returns type int, which is much smaller than
-// the possible size of a range, which could be 2^128 IPs.
-// When an IPSet's count is would be larger than an int, math.MaxInt
-// is returned instead.
-func IPSetCount(ipSet *netipx.IPSet) int {
+// IPSetCountBig returns the exact number of IPs contained in the given IPSet as a
+// big.Int. Unlike IPSetCount the result is never capped, which is required for IPv6
+// ranges (e.g. a /64) whose size does not fit into a platform int.
+func IPSetCountBig(ipSet *netipx.IPSet) *big.Int {
 	if ipSet == nil {
-		return 0
+		return big.NewInt(0)
 	}
 
 	total := big.NewInt(0)
@@ -198,13 +196,28 @@ func IPSetCount(ipSet *netipx.IPSet) int {
 		// Subtracting To and From misses that one of those is a valid IP
 		total.Add(total, big.NewInt(1))
 	}
+	return total
+}
 
-	// If total is greater than Uint64, Uint64() will return 0
-	// We want to display MaxInt if the value overflows what int can contain
-	if total.IsInt64() && total.Uint64() <= uint64(math.MaxInt) {
-		return int(total.Uint64()) //nolint:gosec // [G115] conversion is safe with check beforehand
+// CapBigInt returns the given big.Int value capped at math.MaxInt together with a
+// boolean reporting whether the value exceeded the int range and was capped. It never
+// overflows into a plausible-but-wrong number.
+func CapBigInt(value *big.Int) (int, bool) {
+	maxInt := big.NewInt(int64(math.MaxInt))
+	if value.Cmp(maxInt) > 0 {
+		return math.MaxInt, true
 	}
-	return math.MaxInt
+	return int(value.Int64()), false //nolint:gosec // [G115] conversion is safe with check beforehand
+}
+
+// IPSetCount returns the number of IPs contained in the given IPSet.
+// This function returns type int, which is much smaller than
+// the possible size of a range, which could be 2^128 IPs.
+// When an IPSet's count is would be larger than an int, math.MaxInt
+// is returned instead.
+func IPSetCount(ipSet *netipx.IPSet) int {
+	count, _ := CapBigInt(IPSetCountBig(ipSet))
+	return count
 }
 
 // AddressStrParses checks to see that the addresss string is one of

@@ -18,13 +18,11 @@ package controllers
 
 import (
 	"context"
-	"net/netip"
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -34,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolstats"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
 )
@@ -156,19 +155,8 @@ func (r *GlobalInClusterIPPoolReconciler) Reconcile(ctx context.Context, req ctr
 	return genericReconcile(ctx, r.Client, pool)
 }
 
-func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPool) (_ ctrl.Result, reterr error) {
+func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPool) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-
-	patchHelper, err := patch.NewHelper(pool, c)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	defer func() {
-		if err := patchHelper.Patch(ctx, pool); err != nil {
-			reterr = kerrors.NewAggregate([]error{reterr, err})
-		}
-	}()
 
 	poolTypeRef := ipamv1.IPPoolReference{
 		APIGroup: v1alpha2.GroupVersion.Group,
@@ -176,55 +164,56 @@ func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.Gener
 		Name:     pool.GetName(),
 	}
 
+	// The in-use addresses and the pool spec are the single snapshot from which all
+	// statistics are derived. The status is never consulted for allocation decisions.
 	addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to list addresses")
 	}
 
 	inUseCount := len(addressesInUse)
+	hasFinalizer := controllerutil.ContainsFinalizer(pool, ProtectPoolFinalizer)
 
-	if !controllerutil.ContainsFinalizer(pool, ProtectPoolFinalizer) {
-		controllerutil.AddFinalizer(pool, ProtectPoolFinalizer)
+	// While the pool is deleting it must not receive status updates: the finalizer
+	// keeps the object around until every allocation is released, and once the object
+	// is gone the top-level Reconcile handles NotFound without ever reaching here.
+	if !pool.GetDeletionTimestamp().IsZero() {
+		if inUseCount != 0 || !hasFinalizer {
+			return ctrl.Result{}, nil
+		}
+		patchHelper, err := patch.NewHelper(pool, c)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		controllerutil.RemoveFinalizer(pool, ProtectPoolFinalizer)
+		return ctrl.Result{}, patchHelper.Patch(ctx, pool)
 	}
 
-	if !pool.GetDeletionTimestamp().IsZero() {
-		if inUseCount == 0 {
-			controllerutil.RemoveFinalizer(pool, ProtectPoolFinalizer)
-		}
+	stats, err := poolstats.ComputeIPPoolStats(pool.PoolSpec(), addressesInUse)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to compute pool statistics")
+	}
+
+	// Decide whether anything must be written before mutating the object, so a
+	// steady-state reconcile neither builds a patch helper nor emits an API call.
+	needsFinalizer := !hasFinalizer
+	statusChanged := !stats.EqualsIPStatus(pool.PoolStatus().Addresses)
+	if !needsFinalizer && !statusChanged {
 		return ctrl.Result{}, nil
 	}
 
-	poolIPSet, err := poolutil.PoolSpecToIPSet(pool.PoolSpec())
+	patchHelper, err := patch.NewHelper(pool, c)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to build ip set from pool spec")
+		return ctrl.Result{}, err
 	}
 
-	poolCount := poolutil.IPSetCount(poolIPSet)
-	if pool.PoolSpec().Gateway != "" {
-		gatewayAddr, err := netip.ParseAddr(pool.PoolSpec().Gateway)
-		if err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "failed to parse pool gateway")
-		}
-
-		if poolIPSet.Contains(gatewayAddr) {
-			poolCount--
-		}
+	if needsFinalizer {
+		controllerutil.AddFinalizer(pool, ProtectPoolFinalizer)
 	}
-
-	free := poolCount - inUseCount
-	outOfRangeIPSet, err := poolutil.AddressesOutOfRangeIPSet(addressesInUse, poolIPSet)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to build out of range ip set")
-	}
-
-	pool.PoolStatus().Addresses = &v1alpha2.InClusterIPPoolStatusIPAddresses{
-		Total:      poolCount,
-		Used:       inUseCount,
-		Free:       free,
-		OutOfRange: poolutil.IPSetCount(outOfRangeIPSet),
+	if statusChanged {
+		pool.PoolStatus().Addresses = stats.ToIPStatus()
 	}
 
 	log.Info("Updating pool with usage info", "statusAddresses", pool.PoolStatus().Addresses)
-
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, patchHelper.Patch(ctx, pool)
 }

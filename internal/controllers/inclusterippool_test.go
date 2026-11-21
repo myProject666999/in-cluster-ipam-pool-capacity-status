@@ -78,6 +78,9 @@ var _ = Describe("IP Pool Reconciler", func() {
 				poolStatus := genericPool.PoolStatus()
 				Expect(poolStatus.Addresses.Total).To(Equal(expectedTotal))
 				Expect(poolStatus.Addresses.Free).To(Equal(expectedFree))
+				Expect(poolStatus.Addresses.Exhausted).To(Equal(expectedFree == 0))
+				Expect(poolStatus.Addresses.OutOfRangeAllocations).To(BeFalse())
+				Expect(poolStatus.Addresses.CountsCapped).To(BeFalse())
 			},
 
 			Entry("When there is 1 claim and no gateway - InClusterIPPool",
@@ -176,6 +179,87 @@ var _ = Describe("IP Pool Reconciler", func() {
 				"GlobalInClusterIPPool", []string{"10.0.0.0-10.0.0.255"}, "10.0.0.1", []string{"10.0.0.0", "10.0.0.2-10.0.0.255"}, 5, 1),
 			Entry("GlobalInClusterIPPool when removing broadcast address",
 				"GlobalInClusterIPPool", []string{"10.0.0.251-10.0.0.255"}, "10.0.0.1", []string{"10.0.0.251-10.0.0.254"}, 5, 1),
+		)
+
+		DescribeTable("it exposes stable exhaustion and anomaly flags",
+			func(poolType string) {
+				genericPool = newPool(poolType, testPool, namespace, "", []string{"10.0.0.10-10.0.0.11"}, 24)
+				Expect(k8sClient.Create(context.Background(), genericPool)).To(Succeed())
+
+				Eventually(Object(genericPool)).
+					WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
+					HaveField("Status.Addresses.Total", Equal(2)))
+				Expect(genericPool.PoolStatus().Addresses.Exhausted).To(BeFalse())
+
+				for _, i := range []string{"a", "b"} {
+					claim := newClaim("claim-"+i, namespace, poolType, genericPool.GetName())
+					Expect(k8sClient.Create(context.Background(), &claim)).To(Succeed())
+					createdClaimNames = append(createdClaimNames, claim.Name)
+				}
+
+				Eventually(Object(genericPool)).
+					WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
+					HaveField("Status.Addresses.Exhausted", BeTrue()))
+				Expect(genericPool.PoolStatus().Addresses.Free).To(Equal(0))
+				Expect(genericPool.PoolStatus().Addresses.Used).To(Equal(2))
+				Expect(genericPool.PoolStatus().Addresses.OutOfRangeAllocations).To(BeFalse())
+				// The exhausted-clears-on-release path is covered in the poolstats unit
+				// tests and the fill/release envtest table above; here the AfterEach hook
+				// owns claim cleanup to avoid double-delete races.
+			},
+			Entry("InClusterIPPool", "InClusterIPPool"),
+			Entry("GlobalInClusterIPPool", "GlobalInClusterIPPool"),
+		)
+
+		DescribeTable("it flags out-of-range allocations and clamps free at zero",
+			func(poolType string) {
+				poolSpec := v1alpha2.InClusterIPPoolSpec{
+					Prefix:                      24,
+					Addresses:                   []string{"10.0.0.10-10.0.0.12"},
+					AllocateReservedIPAddresses: true,
+				}
+				switch poolType {
+				case "InClusterIPPool":
+					genericPool = &v1alpha2.InClusterIPPool{
+						ObjectMeta: metav1.ObjectMeta{GenerateName: testPool, Namespace: namespace},
+						Spec:       poolSpec,
+					}
+				case "GlobalInClusterIPPool":
+					genericPool = &v1alpha2.GlobalInClusterIPPool{
+						ObjectMeta: metav1.ObjectMeta{GenerateName: testPool},
+						Spec:       poolSpec,
+					}
+				default:
+					Fail("Unknown pool type")
+				}
+				Expect(k8sClient.Create(context.Background(), genericPool)).To(Succeed())
+
+				for _, i := range []string{"a", "b", "c"} {
+					claim := newClaim("oor-"+i, namespace, poolType, genericPool.GetName())
+					Expect(k8sClient.Create(context.Background(), &claim)).To(Succeed())
+					createdClaimNames = append(createdClaimNames, claim.Name)
+				}
+				Eventually(Object(genericPool)).
+					WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
+					HaveField("Status.Addresses.Used", Equal(3)))
+
+				// Shrink the pool below the number of live allocations. The webhook is
+				// not installed in envtest, so this state is reachable here.
+				genericPool.PoolSpec().Addresses = []string{"10.0.0.10"}
+				Expect(k8sClient.Update(context.Background(), genericPool)).To(Succeed())
+
+				Eventually(Object(genericPool)).
+					WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
+					HaveField("Status.Addresses.OutOfRangeAllocations", BeTrue()))
+				status := genericPool.PoolStatus().Addresses
+				Expect(status.Total).To(Equal(1))
+				Expect(status.Used).To(Equal(3))
+				Expect(status.OutOfRange).To(Equal(2))
+				Expect(status.Free).To(Equal(0), "free must be clamped, never negative")
+				Expect(status.Exhausted).To(BeTrue())
+			},
+			Entry("InClusterIPPool", "InClusterIPPool"),
+			Entry("GlobalInClusterIPPool", "GlobalInClusterIPPool"),
 		)
 	})
 

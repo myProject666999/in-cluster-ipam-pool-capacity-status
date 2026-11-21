@@ -33,6 +33,10 @@ spec:
       jsonPath: .status.ipAddresses.used
       name: Used
       type: integer
+    - description: True when no free sub-prefixes remain in the pool
+      jsonPath: .status.ipAddresses.exhausted
+      name: Exhausted
+      type: boolean
     name: v1alpha2
     schema:
       openAPIV3Schema:
@@ -100,9 +104,30 @@ spec:
                   The JSON tag is "ipAddresses" to match the InClusterIPPool status shape,
                   keeping a consistent status contract across pool types.
                 properties:
+                  countsCapped:
+                    description: |-
+                      CountsCapped is true when at least one of the integer counts is larger than
+                      the platform int range and therefore reported as math.MaxInt instead of its
+                      exact value. It only describes the precision of the numbers; it never
+                      participates in the Free or Exhausted calculation.
+                    type: boolean
+                  excluded:
+                    description: |-
+                      Excluded is the count of candidate sub-prefixes removed from the pool by
+                      spec.ExcludedPrefixes. The informational gateway does not block prefix
+                      allocation and therefore never contributes to this count.
+                      Counts greater than int can contain will report as math.MaxInt.
+                    type: integer
+                  exhausted:
+                    description: |-
+                      Exhausted is true when Free is zero. It is the stable signal for upper-layer
+                      automation to alert on or trigger pool expansion.
+                    type: boolean
                   free:
                     description: |-
-                      Free is the count of unallocated sub-prefixes.
+                      Free is the count of unallocated sub-prefixes. It is clamped at zero and
+                      therefore never negative, even when allocations exist that fall outside the
+                      current allocatable set (see outOfRange).
                       Counts greater than int can contain will report as math.MaxInt.
                     type: integer
                   outOfRange:
@@ -112,6 +137,12 @@ spec:
                       or with the wrong prefix length).
                       Counts greater than int can contain will report as math.MaxInt.
                     type: integer
+                  outOfRangeAllocations:
+                    description: |-
+                      OutOfRangeAllocations is true when OutOfRange is greater than zero. It
+                      highlights the anomalous state where existing allocations are no longer
+                      allocatable under the current spec.
+                    type: boolean
                   total:
                     description: |-
                       Total is the total number of allocatable sub-prefixes in the pool.
@@ -119,7 +150,9 @@ spec:
                     type: integer
                   used:
                     description: |-
-                      Used is the count of allocated sub-prefixes.
+                      Used is the count of allocated sub-prefixes. It counts every IPAddress object
+                      that belongs to the pool, including out-of-range ones, i.e. used == in-range
+                      allocations + outOfRange.
                       Counts greater than int can contain will report as math.MaxInt.
                     type: integer
                 required:

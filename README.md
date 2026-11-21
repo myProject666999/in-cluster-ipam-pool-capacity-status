@@ -112,9 +112,53 @@ Key behavior:
 - `gateway` is informational in this case, it's copied to `IPAddress.spec.gateway` and does not affect reservation
 - Allocated prefix data is stored in `IPAddress.spec.address` (base address) and `IPAddress.spec.prefix` (prefix length)
 
+### Pool capacity status
+
+Every pool reports capacity statistics under `status.ipAddresses`. The fields form a
+stable contract that external alerting and automation can rely on; new fields are only
+ever added, and the meaning of existing fields never changes.
+
+| Field | Meaning |
+| --- | --- |
+| `total` | Size of the allocatable set derived from the merged pool spec (after exclusions, reserved addresses and the gateway). |
+| `used` | Number of `IPAddress` objects belonging to the pool, including out-of-range ones. |
+| `free` | Remaining allocatable capacity, clamped at zero so it is never negative. |
+| `outOfRange` | Allocations that fell outside the current allocatable set (after a pool shrink or a new exclusion). |
+| `excluded` | Addresses (or sub-prefixes) declared in the spec but removed from the allocatable set by exclusions, reserved addresses or the gateway. Overlapping removals are counted once. |
+| `exhausted` | `true` exactly when `free == 0`. This is the stable flag to alert on or use for expansion. |
+| `outOfRangeAllocations` | `true` exactly when `outOfRange > 0`, surfacing the anomalous state without requiring numeric diffing. |
+| `countsCapped` | `true` when at least one integer count exceeded the platform int range and is reported as `math.MaxInt`. |
+
+Accounting rules and invariants, all computed from a single consistent read of the
+pool spec and its address objects:
+
+- `used == in-range allocations + outOfRange`
+- `free == max(0, total - used)`
+- When no cap applies to an IP pool, `total + excluded` equals the size of the raw
+  `spec.addresses` set.
+
+When a pool is shrunk or gains an exclusion that covers existing allocations, those
+addresses still occupy real `IPAddress` objects. They stay counted in `used` (and
+broken out as `outOfRange`), while `free` is clamped to zero and
+`outOfRangeAllocations` highlights the anomaly.
+
+The statistics are **advisory only**. Allocation decisions never read this status;
+they always read the live `IPAddress` objects and the allocatable set at allocation
+time, so a lagging status can neither wrongly reject nor wrongly admit a claim.
+
 ### IPv6 Status Limitations
 
-This provider does fully support IPv6 pools, but they come with a small limitation related to the pools' status. Since the IPv6 address space is very large it exceeds the int64 range, making it cumbersome to calculate the total amount of available addresses for large pools. The status will therefore be limited to the maximum int64 value (2^64), even when more addresses are available. Since the Kubernetes api server will probably not allow storing enough resources to exhaust the pool anyway, we've decided to keep this limitation in favour of simpler implementation.
+This provider fully supports IPv6 pools, but they come with a small limitation related
+to the pools' status. Since the IPv6 address space is very large it exceeds the int64
+range (for example a `/64` contains `2^64` addresses), making it cumbersome to
+calculate the total amount of available addresses for large pools. The integer status
+fields are therefore limited to the maximum int64 value (`math.MaxInt`), even when
+more addresses are available, and the `countsCapped` flag is set to `true` so
+consumers know the displayed number is a cap rather than an exact count. Values are
+computed with arbitrary-precision arithmetic before capping, so they never overflow
+into a plausible-but-wrong number. Since the Kubernetes api server will probably not
+allow storing enough resources to exhaust the pool anyway, we've decided to keep this
+limitation in favour of simpler implementation.
 
 ## Community, discussion, contribution, and support
 

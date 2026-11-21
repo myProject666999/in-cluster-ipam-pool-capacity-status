@@ -69,16 +69,28 @@ type InClusterIPPoolStatus struct {
 }
 
 // InClusterIPPoolStatusIPAddresses contains the count of total, free, and used IPs in a pool.
+//
+// All counts are computed from a single consistent read of the pool spec and its
+// IPAddress objects. They are advisory only: allocation decisions never read this
+// structure, they always read the live address objects and the allocatable set instead.
+//
+// Stability contract: the meaning and JSON names of the existing fields
+// (total, free, used, outOfRange) never change. New fields are always additive and
+// optional, so older readers keep working unchanged.
 type InClusterIPPoolStatusIPAddresses struct {
 	// Total is the total number of IPs configured for the pool.
 	// Counts greater than int can contain will report as math.MaxInt.
 	Total int `json:"total"`
 
-	// Free is the count of unallocated IPs in the pool.
+	// Free is the count of unallocated IPs in the pool. It is clamped at zero and
+	// therefore never negative, even when allocations exist that fall outside the
+	// current allocatable set (see outOfRange).
 	// Counts greater than int can contain will report as math.MaxInt.
 	Free int `json:"free"`
 
-	// Used is the count of allocated IPs in the pool.
+	// Used is the count of allocated IPs in the pool. It counts every IPAddress object
+	// that belongs to the pool, including ones that are no longer part of the
+	// allocatable set, i.e. used == in-range allocations + outOfRange.
 	// Counts greater than int can contain will report as math.MaxInt.
 	Used int `json:"used"`
 
@@ -86,6 +98,36 @@ type InClusterIPPoolStatusIPAddresses struct {
 	// contained within spec.Addresses.
 	// Counts greater than int can contain will report as math.MaxInt.
 	OutOfRange int `json:"outOfRange"`
+
+	// Excluded is the count of addresses declared in spec.Addresses that are not
+	// allocatable because they are removed by spec.ExcludedAddresses, the reserved
+	// network/broadcast (IPv4) or anycast (IPv6) addresses, or the gateway.
+	// Overlapping removals are counted only once because the count is a set
+	// difference. When no cap applies, total + excluded equals the size of the raw
+	// spec.Addresses set.
+	// Counts greater than int can contain will report as math.MaxInt.
+	// +optional
+	Excluded int `json:"excluded,omitempty"`
+
+	// Exhausted is true when Free is zero. It is the stable signal for upper-layer
+	// automation to alert on or trigger pool expansion. It is derived from the
+	// counts above and never computed independently.
+	// +optional
+	Exhausted bool `json:"exhausted,omitempty"`
+
+	// CountsCapped is true when at least one of the integer counts is larger than
+	// the platform int range and therefore reported as math.MaxInt instead of its
+	// exact value. It only describes the precision of the numbers; it never
+	// participates in the Free or Exhausted calculation.
+	// +optional
+	CountsCapped bool `json:"countsCapped,omitempty"`
+
+	// OutOfRangeAllocations is true when OutOfRange is greater than zero. It
+	// highlights the anomalous state where existing allocations fell outside the
+	// current allocatable set after a pool shrink or a new exclusion, so users do
+	// not have to infer the anomaly from numeric differences alone.
+	// +optional
+	OutOfRangeAllocations bool `json:"outOfRangeAllocations,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -96,6 +138,7 @@ type InClusterIPPoolStatusIPAddresses struct {
 // +kubebuilder:printcolumn:name="Total",type="integer",JSONPath=".status.ipAddresses.total",description="Count of IPs configured for the pool"
 // +kubebuilder:printcolumn:name="Free",type="integer",JSONPath=".status.ipAddresses.free",description="Count of unallocated IPs in the pool"
 // +kubebuilder:printcolumn:name="Used",type="integer",JSONPath=".status.ipAddresses.used",description="Count of allocated IPs in the pool"
+// +kubebuilder:printcolumn:name="Exhausted",type="boolean",JSONPath=".status.ipAddresses.exhausted",description="True when no free IPs remain in the pool"
 
 // InClusterIPPool is the Schema for the inclusterippools API.
 type InClusterIPPool struct {
@@ -123,6 +166,7 @@ type InClusterIPPoolList struct {
 // +kubebuilder:printcolumn:name="Total",type="integer",JSONPath=".status.ipAddresses.total",description="Count of IPs configured for the pool"
 // +kubebuilder:printcolumn:name="Free",type="integer",JSONPath=".status.ipAddresses.free",description="Count of unallocated IPs in the pool"
 // +kubebuilder:printcolumn:name="Used",type="integer",JSONPath=".status.ipAddresses.used",description="Count of allocated IPs in the pool"
+// +kubebuilder:printcolumn:name="Exhausted",type="boolean",JSONPath=".status.ipAddresses.exhausted",description="True when no free IPs remain in the pool"
 
 // GlobalInClusterIPPool is the Schema for the global inclusterippools API.
 // This pool type is cluster scoped. IPAddressClaims can reference

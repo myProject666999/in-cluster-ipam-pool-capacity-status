@@ -23,7 +23,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolstats"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
 )
@@ -152,19 +152,8 @@ func (r *GlobalInClusterPrefixPoolReconciler) Reconcile(ctx context.Context, req
 	return genericPrefixReconcile(ctx, r.Client, pool)
 }
 
-func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPrefixPool) (_ ctrl.Result, reterr error) {
+func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPrefixPool) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-
-	patchHelper, err := patch.NewHelper(pool, c)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	defer func() {
-		if err := patchHelper.Patch(ctx, pool); err != nil {
-			reterr = kerrors.NewAggregate([]error{reterr, err})
-		}
-	}()
 
 	poolTypeRef := ipamv1.IPPoolReference{
 		APIGroup: v1alpha2.GroupVersion.Group,
@@ -172,53 +161,55 @@ func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes
 		Name:     pool.GetName(),
 	}
 
+	// Single snapshot: the in-use list and the fetched pool spec feed the stats
+	// calculation together, so total/used/free can never disagree.
 	addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to list addresses")
 	}
 
 	inUseCount := len(addressesInUse)
+	hasFinalizer := controllerutil.ContainsFinalizer(pool, ProtectPoolFinalizer)
 
-	if !controllerutil.ContainsFinalizer(pool, ProtectPoolFinalizer) {
-		controllerutil.AddFinalizer(pool, ProtectPoolFinalizer)
+	// Deleting pools receive no status updates; the finalizer blocks disappearance
+	// until all allocations have been released.
+	if !pool.GetDeletionTimestamp().IsZero() {
+		if inUseCount != 0 || !hasFinalizer {
+			return ctrl.Result{}, nil
+		}
+		patchHelper, err := patch.NewHelper(pool, c)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		controllerutil.RemoveFinalizer(pool, ProtectPoolFinalizer)
+		return ctrl.Result{}, patchHelper.Patch(ctx, pool)
 	}
 
-	if !pool.GetDeletionTimestamp().IsZero() {
-		if inUseCount == 0 {
-			controllerutil.RemoveFinalizer(pool, ProtectPoolFinalizer)
-		}
+	stats, err := poolstats.ComputePrefixPoolStats(pool.PoolSpec(), addressesInUse)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to compute prefix pool statistics")
+	}
+
+	// Decide first, mutate second, so identical content skips both the helper and
+	// the API write and does not produce update events for other controllers.
+	needsFinalizer := !hasFinalizer
+	statusChanged := !stats.EqualsPrefixStatus(pool.PoolStatus().Addresses)
+	if !needsFinalizer && !statusChanged {
 		return ctrl.Result{}, nil
 	}
 
-	config := poolutil.NewPrefixPoolConfig(pool.PoolSpec())
-	total, err := poolutil.PrefixCandidateCount(config)
+	patchHelper, err := patch.NewHelper(pool, c)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to count allocatable prefixes")
+		return ctrl.Result{}, err
 	}
 
-	outOfRange := 0
-	for _, inUse := range addressesInUse {
-		prefix, err := poolutil.PrefixFromIPAddress(inUse)
-		if err != nil || !poolutil.PrefixIsAllocatable(prefix, config) {
-			outOfRange++
-		}
+	if needsFinalizer {
+		controllerutil.AddFinalizer(pool, ProtectPoolFinalizer)
 	}
-
-	// Prefix pool status accounting intentionally differs from IP address pool:
-	// OutOfRange counts allocations whose prefix no longer matches the current spec
-	// (e.g. after an excludedPrefixes change).
-	// Free reports remaining allocatable capacity, so out-of-range allocations
-	// are added back when computing free because they don't consume a valid slot.
-	free := max(0, total-inUseCount+outOfRange)
-
-	pool.PoolStatus().Addresses = &v1alpha2.InClusterPrefixPoolStatusAddresses{
-		Total:      total,
-		Used:       inUseCount,
-		Free:       free,
-		OutOfRange: outOfRange,
+	if statusChanged {
+		pool.PoolStatus().Addresses = stats.ToPrefixStatus()
 	}
 
 	log.Info("Updating prefix pool with usage info", "statusAddresses", pool.PoolStatus().Addresses)
-
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, patchHelper.Patch(ctx, pool)
 }
